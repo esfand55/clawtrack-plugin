@@ -1,0 +1,46 @@
+{
+  "id": "clawtrack",
+  "name": "ClawTrack Integration",
+  "description": "Bidirectional integration between ClawTrack and OpenClaw — task management, channels, and agent orchestration",
+  "version": "2.0.0",
+  "skills": [
+    "./skills/clawtrack"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "clawtrackUrl": {
+        "type": "string",
+        "description": "ClawTrack base URL (e.g., http://localhost:3000)"
+      },
+      "webhookSecret": {
+        "type": "string",
+        "description": "Shared secret for webhook authentication"
+      },
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable the ClawTrack integration"
+      },
+      "channelsEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable channel-related tools (list_channels, send_channel_message, etc.)"
+      },
+      "contextInjectionEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject project/task context into agent sessions"
+      }
+    },
+    "required": ["clawtrackUrl", "webhookSecret"]
+  },
+  "uiHints": {
+    "clawtrackUrl": { "label": "ClawTrack URL", "placeholder": "http://localhost:3000" },
+    "webhookSecret": { "label": "Webhook Secret", "placeholder": "Shared secret for authentication" },
+    "enabled": { "label": "Enable integration" },
+    "channelsEnabled": { "label": "Enable channels" },
+    "contextInjectionEnabled": { "label": "Enable context injection" }
+  }
+}

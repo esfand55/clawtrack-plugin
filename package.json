@@ -1,0 +1,13 @@
+{
+  "name": "@openclaw/clawtrack",
+  "version": "1.0.0",
+  "description": "ClawTrack integration plugin for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "openclaw": "*"
+  },
+  "devDependencies": {}
+}

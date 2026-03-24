@@ -44,7 +44,9 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
  * - clawtrack_update_task_status: Update task status
  * - clawtrack_get_project_tasks: List tasks in a project
  * - clawtrack_list_tasks: List tasks assigned to the calling agent
- * - clawtrack_update_task: Update task status/description/priority
+ * - clawtrack_update_task: Update task status/description/priority/reviewer
+ * - clawtrack_review_task: Approve or reject a task under review
+ * - clawtrack_pick_reviewer: Find the least busy engineer to review a task
  * - clawtrack_log_activity: Log an activity entry
  * - clawtrack_send_message_v2: Send message via unified REST webhook
  *
@@ -183,6 +185,18 @@ export default definePluginEntry({
         lines.push(taskSummary);
       }
       lines.push("All clawtrack operations are automatically scoped to this project.");
+      lines.push("");
+      lines.push("## Task Workflow (MANDATORY — follow this on every task)");
+      lines.push("1. Pick work: call clawtrack_list_tasks({ includeBacklog: true }) to see unassigned backlog tasks, self-assign the highest priority one");
+      lines.push("2. ONE TASK AT A TIME — never start a second task while one is in_progress");
+      lines.push("3. Move picked task to 'todo', sort your todo list by priority, start the top one → 'in_progress'");
+      lines.push("4. When done: call clawtrack_pick_reviewer() to find the least busy engineer, set them as reviewer");
+      lines.push("5. Set reviewer via clawtrack_update_task(taskId, { reviewerId: '...' })");
+      lines.push("6. Move to 'review' via clawtrack_update_task_status(taskId, 'review') and message the reviewer");
+      lines.push("7. NEVER call clawtrack_update_task_status(taskId, 'done') — only reviewers approve tasks via clawtrack_review_task()");
+      lines.push("8. If you are the assigned reviewer: finish your current task first (no context switching), then review");
+      lines.push("9. Use clawtrack_review_task(taskId, decision, feedback) to approve or reject");
+      lines.push("10. If you reject: explain clearly what needs to change so the assignee can fix it");
       return "\n" + lines.join("\n") + "\n";
     }
 
@@ -276,7 +290,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_update_task_status",
       label: "Update ClawTrack task status",
-      description: "Update the status of a ClawTrack task (e.g., mark as done when you complete work).",
+      description: "Update the status of a ClawTrack task. RULES: (1) You CANNOT go directly to 'done' — tasks must go through review first. (2) To move to 'review', you must first assign a reviewer via clawtrack_update_task. Valid flow: backlog → todo → in_progress → review → done.",
       parameters: {
         type: "object",
         properties: {
@@ -340,25 +354,40 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_list_tasks",
       label: "List my ClawTrack tasks",
-      description: "List tasks assigned to you (the calling agent) in ClawTrack. Automatically scoped to the active project if one is set. Optionally filter by status.",
+      description: "List tasks assigned to you in ClawTrack. Use includeBacklog: true to also see unassigned backlog tasks you can pick up. Automatically scoped to the active project if one is set.",
       parameters: {
         type: "object",
         properties: {
           status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "Optional: filter by status" },
           projectKey: { type: "string", description: "Optional: override the active project filter" },
           limit: { type: "number", description: "Maximum tasks to return (default: 50)" },
+          includeBacklog: { type: "boolean", description: "If true, also return unassigned backlog tasks you can pick up" },
         },
       },
       execute: async (_toolCallId, args: any) => {
         try {
           const sessionKey = api.session?.sessionKey ?? "";
           const project = getActiveProject(sessionKey);
+          const effectiveProjectKey = args.projectKey || project?.key;
+
+          // Fetch tasks assigned to this agent
           const params = new URLSearchParams({ agent_id: resolveAgentId(), limit: String(args.limit || 50) });
           if (args.status) params.set("status", args.status);
-          // Auto-scope to active project unless explicitly overridden
-          const effectiveProjectKey = args.projectKey || project?.key;
           if (effectiveProjectKey) params.set("project_key", effectiveProjectKey);
           const result = await restGet(`/api/v1/tasks/?${params}`);
+
+          // If includeBacklog, also fetch unassigned backlog tasks
+          if (args.includeBacklog && effectiveProjectKey) {
+            const backlogParams = new URLSearchParams({ project_key: effectiveProjectKey, status: "backlog", limit: "20" });
+            const backlogResult = await restGet(`/api/v1/tasks/?${backlogParams}`);
+            if (backlogResult?.data && Array.isArray(backlogResult.data)) {
+              const unassigned = backlogResult.data.filter((t: any) => !t.assignee_id && !t.assigneeId);
+              if (unassigned.length > 0) {
+                result.backlog = unassigned;
+              }
+            }
+          }
+
           return textResult(JSON.stringify(result, null, 2), { success: true, project: effectiveProjectKey });
         } catch (error) {
           return textResult(`Failed to list tasks: ${error}`, { success: false });
@@ -371,7 +400,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_update_task",
       label: "Update ClawTrack task",
-      description: "Update a ClawTrack task's status, description, and/or priority in a single call.",
+      description: "Update a ClawTrack task's status, description, priority, and/or reviewer in a single call.",
       parameters: {
         type: "object",
         properties: {
@@ -379,6 +408,7 @@ export default definePluginEntry({
           status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "Optional: new status" },
           description: { type: "string", description: "Optional: new description" },
           priority: { type: "string", enum: ["low", "medium", "high", "urgent"], description: "Optional: new priority" },
+          reviewerId: { type: "string", description: "Optional: Agent ID to assign as reviewer. Set to empty string to clear." },
         },
         required: ["taskId"],
       },
@@ -391,13 +421,127 @@ export default definePluginEntry({
           };
           if (args.status) webhookBody.status = args.status;
           if (args.priority) webhookBody.priority = args.priority;
+          if (args.reviewerId !== undefined) webhookBody.reviewerId = args.reviewerId || null;
           const result = await apiCall("tasks.webhook", "POST", webhookBody);
           const updates: string[] = [];
           if (args.status) updates.push(`status → ${args.status}`);
           if (args.priority) updates.push(`priority → ${args.priority}`);
+          if (args.reviewerId !== undefined) updates.push(`reviewer → ${args.reviewerId || "cleared"}`);
           return textResult(`Task updated: ${updates.join(", ") || "no changes"}.`, { success: true, task: result.result });
         } catch (error) {
           return textResult(`Failed to update task: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Review task (approve/reject) ──
+
+    api.registerTool({
+      name: "clawtrack_review_task",
+      label: "Review ClawTrack task",
+      description: "Approve or reject a task that is under review. Call this when you are the assigned reviewer. Approving moves the task to Done; rejecting sends it back to In Progress with your feedback.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          decision: { type: "string", enum: ["approve", "reject"], description: "Whether to approve or reject the task" },
+          feedback: { type: "string", description: "Feedback explaining your decision. Required when rejecting." },
+        },
+        required: ["taskId", "decision"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const newStatus = args.decision === "approve" ? "done" : "in_progress";
+          const result = await apiCall("tasks.webhook", "POST", {
+            secret: config.webhookSecret,
+            taskId: args.taskId,
+            agentId: resolveAgentId(),
+            status: newStatus,
+          });
+
+          // Post feedback as a comment
+          const commentText = args.decision === "approve"
+            ? "Task approved."
+            : `Changes requested: ${args.feedback || "No feedback provided."}`;
+
+          await webhookCall({
+            type: "message",
+            taskId: args.taskId,
+            role: "agent",
+            content: commentText,
+            agentId: resolveAgentId(),
+          });
+
+          return textResult(
+            args.decision === "approve"
+              ? `Task approved and moved to Done.`
+              : `Task rejected and sent back to In Progress. Feedback sent.`,
+            { success: true, task: result.result },
+          );
+        } catch (error) {
+          return textResult(`Failed to review task: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Pick reviewer (find least busy engineer) ──
+
+    api.registerTool({
+      name: "clawtrack_pick_reviewer",
+      label: "Pick a reviewer for a task",
+      description: "Find the best engineer to review a task. Returns the agent with the fewest active tasks (todo + in_progress). Excludes the specified agent (usually yourself). Use this when you need to assign a reviewer after completing work.",
+      parameters: {
+        type: "object",
+        properties: {
+          excludeAgentId: { type: "string", description: "Agent ID to exclude from reviewer selection (usually your own ID)" },
+        },
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const sessionKey = api.session?.sessionKey ?? "";
+          const project = getActiveProject(sessionKey);
+          const effectiveProjectKey = project?.key;
+
+          if (!effectiveProjectKey) {
+            return textResult("No active project set. Activate a project with clawtrack_set_project first.", { success: false });
+          }
+
+          // Fetch all tasks in the project to count per agent
+          const params = new URLSearchParams({ project_key: effectiveProjectKey, limit: "100" });
+          const result = await restGet(`/api/v1/tasks/?${params}`);
+          const tasks = result?.data;
+          if (!Array.isArray(tasks)) {
+            return textResult("Failed to fetch tasks for workload analysis.", { success: false });
+          }
+
+          // Count active tasks per agent (todo + in_progress)
+          const workload: Record<string, { count: number; name: string; emoji: string; id: string }> = {};
+          for (const task of tasks) {
+            const assigneeId = task.assignee_id || task.assigneeId;
+            if (!assigneeId) continue;
+            const status = task.status;
+            if (status !== "todo" && status !== "in_progress") continue;
+            if (assigneeId === args.excludeAgentId) continue;
+            if (!workload[assigneeId]) {
+              workload[assigneeId] = { count: 0, name: task.assignee_name || task.assignee?.name || assigneeId, emoji: task.assignee_emoji || task.assignee?.emoji || "👤", id: assigneeId };
+            }
+            workload[assigneeId].count++;
+          }
+
+          // Sort by task count (ascending) — least busy first
+          const sorted = Object.values(workload).sort((a, b) => a.count - b.count);
+
+          if (sorted.length === 0) {
+            return textResult("No other agents with active tasks found in this project.", { success: false });
+          }
+
+          const picked = sorted[0];
+          return textResult(
+            `Suggested reviewer: ${picked.emoji} ${picked.name} (${picked.count} active tasks).\nOther options: ${sorted.slice(1).map(a => `${a.emoji} ${a.name} (${a.count})`).join(", ")}`,
+            { success: true, reviewer: { agentId: picked.id, agentName: picked.name, agentEmoji: picked.emoji, taskCount: picked.count }, allAgents: sorted },
+          );
+        } catch (error) {
+          return textResult(`Failed to pick reviewer: ${error}`, { success: false });
         }
       },
     });
@@ -983,6 +1127,8 @@ export default definePluginEntry({
       "clawtrack_get_project_tasks",
       "clawtrack_list_tasks",
       "clawtrack_update_task",
+      "clawtrack_review_task",
+      "clawtrack_pick_reviewer",
       "clawtrack_log_activity",
       "clawtrack_send_message_v2",
       "clawtrack_set_project",

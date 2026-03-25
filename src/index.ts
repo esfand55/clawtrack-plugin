@@ -954,25 +954,15 @@ export default definePluginEntry({
 
     // ── Hook: LLM responded ──
     api.on("llm_output", (event, ctx) => {
-      // Legacy usage tracking (keep existing behavior)
-      webhookCall({
-        type: "llm_usage",
-        agentId: ctx?.agentId ?? resolveAgentId(),
-        provider: event.provider,
-        model: event.model,
-        usage: event.usage,
-        runId: event.runId,
-      }).catch((err) => api.logger.error(`clawtrack: llm_output hook failed: ${err}`));
-
-      // New: broadcast as agent event for live feed
       webhookCall({
         type: "agent_status",
         status: "llm_output",
+        agentId: ctx?.agentId ?? resolveAgentId(),
         model: event.model,
         provider: event.provider,
         usage: event.usage,
         runId: event.runId,
-      }).catch((err) => api.logger.error(`clawtrack: llm_output status hook failed: ${err}`));
+      }).catch((err) => api.logger.error(`clawtrack: llm_output hook failed: ${err}`));
     });
 
     // ── Hook: Auto-log all tool calls as ClawTrack activities + live status ──
@@ -1053,6 +1043,22 @@ export default definePluginEntry({
         content,
         to: (event as any).message?.to,
       }).catch((err) => api.logger.error(`clawtrack: message_sent hook failed: ${err}`));
+    });
+
+    // ── Hook: Session start → heartbeat (agent is alive) ──
+    api.on("session_start", (_event, ctx) => {
+      webhookCall({
+        type: "agent_status",
+        status: "idle",
+      }).catch((err) => api.logger.error(`clawtrack: session_start hook failed: ${err}`));
+    });
+
+    // ── Hook: Session end → mark as idle ──
+    api.on("session_end", (_event, ctx) => {
+      webhookCall({
+        type: "agent_status",
+        status: "idle",
+      }).catch((err) => api.logger.error(`clawtrack: session_end hook failed: ${err}`));
     });
 
     // ════════════════════════════════════════════

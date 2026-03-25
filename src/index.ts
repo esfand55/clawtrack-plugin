@@ -925,17 +925,64 @@ export default definePluginEntry({
     }
 
     // ════════════════════════════════════════════
-    // Event-Driven Hooks: Passive observation
+    // Event-Driven Hooks: Passive observation + Live Status
     // ════════════════════════════════════════════
 
-    // ── Hook: Auto-log all tool calls as ClawTrack activities ──
+    // ── Hook: Agent starts processing (thinking) ──
+    api.on("before_agent_start", (event, ctx) => {
+      const prompt = typeof (event as any).prompt === "string"
+        ? (event as any).prompt.substring(0, 200)
+        : undefined;
+
+      webhookCall({
+        type: "agent_status",
+        status: "thinking",
+        prompt,
+      }).catch((err) => api.logger.error(`clawtrack: before_agent_start hook failed: ${err}`));
+    });
+
+    // ── Hook: LLM call about to happen (processing) ──
+    api.on("llm_input", (event, ctx) => {
+      webhookCall({
+        type: "agent_status",
+        status: "processing",
+        model: event.model,
+        provider: event.provider,
+        runId: event.runId,
+      }).catch((err) => api.logger.error(`clawtrack: llm_input hook failed: ${err}`));
+    });
+
+    // ── Hook: LLM responded ──
+    api.on("llm_output", (event, ctx) => {
+      // Legacy usage tracking (keep existing behavior)
+      webhookCall({
+        type: "llm_usage",
+        agentId: ctx?.agentId ?? resolveAgentId(),
+        provider: event.provider,
+        model: event.model,
+        usage: event.usage,
+        runId: event.runId,
+      }).catch((err) => api.logger.error(`clawtrack: llm_output hook failed: ${err}`));
+
+      // New: broadcast as agent event for live feed
+      webhookCall({
+        type: "agent_status",
+        status: "llm_output",
+        model: event.model,
+        provider: event.provider,
+        usage: event.usage,
+        runId: event.runId,
+      }).catch((err) => api.logger.error(`clawtrack: llm_output status hook failed: ${err}`));
+    });
+
+    // ── Hook: Auto-log all tool calls as ClawTrack activities + live status ──
     api.on("after_tool_call", (event, ctx) => {
-      const agentId = ctx?.agentId ?? resolveAgentId();
       const paramsPreview = JSON.stringify(event.params ?? {}).substring(0, 200);
       const description = event.error
         ? `${event.toolName} failed: ${event.error}`
         : `${event.toolName}(${paramsPreview})`;
 
+      // Legacy: store as activity
       webhookCall({
         type: "activity",
         activityType: "tool_called",
@@ -947,10 +994,22 @@ export default definePluginEntry({
           runId: event.runId,
         },
       }).catch((err) => api.logger.error(`clawtrack: after_tool_call hook failed: ${err}`));
+
+      // New: broadcast as agent status for live feed
+      webhookCall({
+        type: "agent_status",
+        status: "tool_call",
+        toolName: event.toolName,
+        durationMs: event.durationMs,
+        success: !event.error,
+        error: event.error,
+        runId: event.runId,
+      }).catch((err) => api.logger.error(`clawtrack: after_tool_call status hook failed: ${err}`));
     });
 
-    // ── Hook: Track agent run completion ──
+    // ── Hook: Track agent run completion → idle ──
     api.on("agent_end", (event, ctx) => {
+      // Legacy: track run end
       webhookCall({
         type: "agent_run_end",
         agentId: ctx?.agentId ?? resolveAgentId(),
@@ -959,18 +1018,41 @@ export default definePluginEntry({
         error: event.error,
         trigger: ctx?.trigger,
       }).catch((err) => api.logger.error(`clawtrack: agent_end hook failed: ${err}`));
+
+      // New: set agent to idle
+      webhookCall({
+        type: "agent_status",
+        status: "idle",
+        success: event.success,
+        durationMs: event.durationMs,
+        error: event.error,
+      }).catch((err) => api.logger.error(`clawtrack: agent_end status hook failed: ${err}`));
     });
 
-    // ── Hook: Track LLM token usage per run ──
-    api.on("llm_output", (event, ctx) => {
+    // ── Hook: Message received ──
+    api.on("message_received", (event, ctx) => {
+      const content = extractTextContent((event as any).message?.content);
+      if (!content) return;
+
       webhookCall({
-        type: "llm_usage",
-        agentId: ctx?.agentId ?? resolveAgentId(),
-        provider: event.provider,
-        model: event.model,
-        usage: event.usage,
-        runId: event.runId,
-      }).catch((err) => api.logger.error(`clawtrack: llm_output hook failed: ${err}`));
+        type: "agent_status",
+        status: "message_received",
+        content,
+        from: (event as any).message?.provenance?.sourceSessionKey?.split(":")[1],
+      }).catch((err) => api.logger.error(`clawtrack: message_received hook failed: ${err}`));
+    });
+
+    // ── Hook: Message sent ──
+    api.on("message_sent", (event, ctx) => {
+      const content = extractTextContent((event as any).message?.content);
+      if (!content) return;
+
+      webhookCall({
+        type: "agent_status",
+        status: "message_sent",
+        content,
+        to: (event as any).message?.to,
+      }).catch((err) => api.logger.error(`clawtrack: message_sent hook failed: ${err}`));
     });
 
     // ════════════════════════════════════════════

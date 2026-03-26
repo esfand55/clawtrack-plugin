@@ -74,25 +74,79 @@ export default definePluginEntry({
 
     api.logger.info(`clawtrack plugin loaded (url=${config.clawtrackUrl}, channels=${config.channelsEnabled})`);
 
-    // ── Helper: resolve agent ID ──
+    // ── Session context storage (captured via hooks) ──
+    const sessionContext = new Map<string, { agentId: string; sessionKey: string }>();
 
-    function resolveAgentId(): string {
-      const rawId = api.session?.agentId;
+    // Capture session context before each tool call
+    api.on("before_tool_call", (event: any, ctx: any) => {
+      if (ctx?.toolCallId && ctx?.agentId) {
+        sessionContext.set(ctx.toolCallId, {
+          agentId: ctx.agentId,
+          sessionKey: ctx.sessionKey || "",
+        });
+        // Clean up old entries (keep last 100)
+        if (sessionContext.size > 100) {
+          const firstKey = sessionContext.keys().next().value;
+          if (firstKey) sessionContext.delete(firstKey);
+        }
+      }
+    });
+
+    // ── Helper: resolve agent ID from tool call context ──
+    function resolveAgentId(toolCallId?: string): string {
+      // Try to get from captured session context
+      if (toolCallId) {
+        const ctx = sessionContext.get(toolCallId);
+        if (ctx?.agentId) {
+          const rawId = ctx.agentId;
+          if (rawId.startsWith("agent-")) return rawId;
+          return `agent-${rawId}`;
+        }
+      }
+
+      // Fallback: Try api.session.agentId
+      let rawId = api.session?.agentId;
+
+      // Fallback: extract from sessionKey (format: "agent:jane:main")
+      if (!rawId && api.session?.sessionKey) {
+        const parts = api.session.sessionKey.split(':');
+        if (parts.length >= 2 && parts[0] === 'agent') {
+          rawId = parts[1];
+        }
+      }
+
       if (!rawId) return "unknown";
       if (rawId.startsWith("agent-")) return rawId;
       return `agent-${rawId}`;
     }
 
+    // ── Helper: resolve session key from tool call context ──
+    function resolveSessionKey(toolCallId?: string): string {
+      // Try to get from captured session context
+      if (toolCallId) {
+        const ctx = sessionContext.get(toolCallId);
+        if (ctx?.sessionKey) {
+          return ctx.sessionKey;
+        }
+      }
+      // Fallback: Try api.session.sessionKey
+      return api.session?.sessionKey ?? "";
+    }
+
     // ── Helper: make authenticated API call (tRPC) ──
 
     async function apiCall(endpoint: string, method: string = "GET", body?: any): Promise<any> {
-      const url = `${config.clawtrackUrl}/api/trpc/${endpoint}`;
+      let url = `${config.clawtrackUrl}/api/trpc/${endpoint}`;
       const options: RequestInit = {
         method,
         headers: { "Content-Type": "application/json" },
       };
 
-      if (method === "POST" && body) {
+      if (method === "GET" && body) {
+        // For tRPC GET requests, pass input as URL-encoded query parameter
+        const inputJson = JSON.stringify(body);
+        url += `?input=${encodeURIComponent(inputJson)}`;
+      } else if (method === "POST" && body) {
         options.body = JSON.stringify(body);
       }
 
@@ -126,7 +180,7 @@ export default definePluginEntry({
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...body, secret: config.webhookSecret, agentId: resolveAgentId() }),
+        body: JSON.stringify({ ...body, secret: config.webhookSecret, agentId: resolveAgentId(_toolCallId) }),
       });
 
       if (!response.ok) {
@@ -219,11 +273,13 @@ export default definePluginEntry({
         required: ["taskId", "message"],
       },
       execute: async (_toolCallId, args: any) => {
+        console.log('[clawtrack-plugin] _toolCallId:', _toolCallId);
+        console.log('[clawtrack-plugin] api.config:', JSON.stringify(api.config, null, 2).substring(0, 500));
         try {
           const result = await apiCall("comments.webhook", "POST", {
             secret: config.webhookSecret,
             taskId: args.taskId,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
             content: args.message,
           });
           return textResult("Message sent successfully.", { success: true, messageId: result.result?.messageId });
@@ -275,7 +331,7 @@ export default definePluginEntry({
           const result = await apiCall("comments.webhook", "POST", {
             secret: config.webhookSecret,
             taskId: args.taskId,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
             content: args.message,
           });
           return textResult("Reply sent successfully.", { success: true, messageId: result.result?.messageId });
@@ -305,7 +361,7 @@ export default definePluginEntry({
             secret: config.webhookSecret,
             taskId: args.taskId,
             status: args.status,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
           });
           return textResult(`Task status updated to ${args.status}.`, { success: true, task: result.result });
         } catch (error) {
@@ -329,15 +385,15 @@ export default definePluginEntry({
       },
       execute: async (_toolCallId, args: any) => {
         try {
-          const sessionKey = api.session?.sessionKey ?? "";
+          const sessionKey = resolveSessionKey(_toolCallId);
           const project = getActiveProject(sessionKey);
           const effectiveProjectKey = args.projectKey || project?.key;
           if (!effectiveProjectKey) {
             return textResult("No active project set. Provide a projectKey or activate a project with clawtrack_set_project.", { success: false });
           }
-          const params = new URLSearchParams({ project_key: effectiveProjectKey, limit: "50" });
-          if (args.status) params.set("status", args.status);
-          const result = await restGet(`/api/v1/tasks/?${params}`);
+          const params: any = { projectKey: effectiveProjectKey, limit: 50 };
+          if (args.status) params.status = args.status;
+          const result = await apiCall("tasks.list", "GET", params);
           return textResult(JSON.stringify(result, null, 2), { success: true, project: effectiveProjectKey });
         } catch (error) {
           return textResult(`Failed to list tasks: ${error}`, { success: false });
@@ -366,22 +422,23 @@ export default definePluginEntry({
       },
       execute: async (_toolCallId, args: any) => {
         try {
-          const sessionKey = api.session?.sessionKey ?? "";
+          const sessionKey = resolveSessionKey(_toolCallId);
           const project = getActiveProject(sessionKey);
           const effectiveProjectKey = args.projectKey || project?.key;
+          const agentId = resolveAgentId(_toolCallId);
 
-          // Fetch tasks assigned to this agent
-          const params = new URLSearchParams({ agent_id: resolveAgentId(), limit: String(args.limit || 50) });
-          if (args.status) params.set("status", args.status);
-          if (effectiveProjectKey) params.set("project_key", effectiveProjectKey);
-          const result = await restGet(`/api/v1/tasks/?${params}`);
+          // Fetch tasks assigned to this agent via tRPC
+          const params: any = { assigneeId: agentId, limit: args.limit || 50 };
+          if (args.status) params.status = args.status;
+          if (effectiveProjectKey) params.projectKey = effectiveProjectKey;
+          const result = await apiCall("tasks.list", "GET", params);
 
           // If includeBacklog, also fetch unassigned backlog tasks
           if (args.includeBacklog && effectiveProjectKey) {
-            const backlogParams = new URLSearchParams({ project_key: effectiveProjectKey, status: "backlog", limit: "20" });
-            const backlogResult = await restGet(`/api/v1/tasks/?${backlogParams}`);
-            if (backlogResult?.data && Array.isArray(backlogResult.data)) {
-              const unassigned = backlogResult.data.filter((t: any) => !t.assignee_id && !t.assigneeId);
+            const backlogParams: any = { projectKey: effectiveProjectKey, status: "backlog", limit: 20 };
+            const backlogResult = await apiCall("tasks.list", "GET", backlogParams);
+            if (backlogResult?.result?.data?.items && Array.isArray(backlogResult.result.data.items)) {
+              const unassigned = backlogResult.result.data.items.filter((t: any) => !t.assigneeId);
               if (unassigned.length > 0) {
                 result.backlog = unassigned;
               }
@@ -419,7 +476,7 @@ export default definePluginEntry({
           const webhookBody: any = {
             secret: config.webhookSecret,
             taskId: args.taskId,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
           };
           if (args.status) webhookBody.status = args.status;
           if (args.priority) webhookBody.priority = args.priority;
@@ -461,7 +518,7 @@ export default definePluginEntry({
           const result = await apiCall("tasks.webhook", "POST", {
             secret: config.webhookSecret,
             taskId: args.taskId,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
             status: newStatus,
           });
 
@@ -475,7 +532,7 @@ export default definePluginEntry({
             taskId: args.taskId,
             role: "agent",
             content: commentText,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
           });
 
           return textResult(
@@ -504,7 +561,7 @@ export default definePluginEntry({
       },
       execute: async (_toolCallId, args: any) => {
         try {
-          const sessionKey = api.session?.sessionKey ?? "";
+          const sessionKey = resolveSessionKey(_toolCallId);
           const project = getActiveProject(sessionKey);
           const effectiveProjectKey = project?.key;
 
@@ -513,9 +570,9 @@ export default definePluginEntry({
           }
 
           // Fetch all tasks in the project to count per agent
-          const params = new URLSearchParams({ project_key: effectiveProjectKey, limit: "100" });
-          const result = await restGet(`/api/v1/tasks/?${params}`);
-          const tasks = result?.data;
+          const params: any = { projectKey: effectiveProjectKey, limit: 100 };
+          const result = await apiCall("tasks.list", "GET", params);
+          const tasks = result?.result?.data?.items;
           if (!Array.isArray(tasks)) {
             return textResult("Failed to fetch tasks for workload analysis.", { success: false });
           }
@@ -523,13 +580,13 @@ export default definePluginEntry({
           // Count active tasks per agent (todo + in_progress)
           const workload: Record<string, { count: number; name: string; emoji: string; id: string }> = {};
           for (const task of tasks) {
-            const assigneeId = task.assignee_id || task.assigneeId;
+            const assigneeId = task.assigneeId;
             if (!assigneeId) continue;
             const status = task.status;
             if (status !== "todo" && status !== "in_progress") continue;
             if (assigneeId === args.excludeAgentId) continue;
             if (!workload[assigneeId]) {
-              workload[assigneeId] = { count: 0, name: task.assignee_name || task.assignee?.name || assigneeId, emoji: task.assignee_emoji || task.assignee?.emoji || "👤", id: assigneeId };
+              workload[assigneeId] = { count: 0, name: task.assignee?.name || assigneeId, emoji: task.assignee?.emoji || "👤", id: assigneeId };
             }
             workload[assigneeId].count++;
           }
@@ -603,9 +660,9 @@ export default definePluginEntry({
             taskType,
             skills: args.skills || undefined,
             attachments: attachments.length > 0 ? attachments : undefined,
-            assigneeId: args.assigneeId || resolveAgentId(),
+            assigneeId: args.assigneeId || resolveAgentId(_toolCallId),
             projectId: args.projectId,
-            agentId: resolveAgentId(),
+            agentId: resolveAgentId(_toolCallId),
           });
 
           return textResult(
@@ -752,7 +809,7 @@ export default definePluginEntry({
             const result = await apiCall("channelMessages.webhook", "POST", {
               secret: config.webhookSecret,
               channelId: args.channelId,
-              agentId: resolveAgentId(),
+              agentId: resolveAgentId(_toolCallId),
               content: args.content,
             });
             return textResult("Channel message sent.", { success: true, messageId: result.result?.messageId });
@@ -778,7 +835,7 @@ export default definePluginEntry({
         execute: async (_toolCallId, args: any) => {
           try {
             const result = await apiCall("channels.getOrCreateDM", "POST", {
-              participantAId: resolveAgentId(),
+              participantAId: resolveAgentId(_toolCallId),
               participantBId: args.agentId,
               participantAType: "agent",
               participantBType: "agent",
@@ -835,7 +892,7 @@ export default definePluginEntry({
             const result = await apiCall("channelMessages.addReaction", "POST", {
               messageId: args.messageId,
               emoji: args.emoji,
-              agentId: resolveAgentId(),
+              agentId: resolveAgentId(_toolCallId),
             });
             return textResult(`Reaction ${args.emoji} added.`, { success: true, reaction: result.result });
           } catch (error) {
@@ -914,7 +971,7 @@ export default definePluginEntry({
         const message = event.message as any;
         if (!message) return;
 
-        const sessionId = api.session?.sessionKey ?? "";
+        const sessionId = resolveSessionKey(_toolCallId);
 
         if (message.role === "user") {
           // ── Project Lens: auto-detect [PROJECT: KEY — Name] tags ──
@@ -924,12 +981,13 @@ export default definePluginEntry({
             if (parsed && sessionId) {
               const previous = getActiveProject(sessionId);
               if (previous?.key !== parsed.key) {
-                // Fetch full project details from REST API
-                restGet(`/api/v1/projects/${parsed.key}`).then((full) => {
-                  if (full?.project_key) {
-                    parsed.description = full.description;
-                    parsed.tech_stack = full.tech_stack;
-                    parsed.conventions = full.conventions;
+                // Fetch full project details via tRPC
+                apiCall("projects.getByKey", "GET", { key: parsed.key }).then((full) => {
+                  const proj = full?.result?.data?.project;
+                  if (proj?.key) {
+                    parsed.description = proj.description;
+                    parsed.tech_stack = proj.techStack;
+                    parsed.conventions = proj.conventions;
                     setActiveProject(sessionId, parsed);
                     writeProjectContextFile(parsed);
                     const switchMsg = previous
@@ -1029,7 +1087,7 @@ export default definePluginEntry({
       webhookCall({
         type: "agent_status",
         status: "llm_output",
-        agentId: ctx?.agentId ?? resolveAgentId(),
+        agentId: ctx?.agentId ?? resolveAgentId(_toolCallId),
         model: event.model,
         provider: event.provider,
         usage: event.usage,
@@ -1074,7 +1132,7 @@ export default definePluginEntry({
       // Legacy: track run end
       webhookCall({
         type: "agent_run_end",
-        agentId: ctx?.agentId ?? resolveAgentId(),
+        agentId: ctx?.agentId ?? resolveAgentId(_toolCallId),
         success: event.success,
         durationMs: event.durationMs,
         error: event.error,
@@ -1143,30 +1201,33 @@ export default definePluginEntry({
       const project = getActiveProject(sessionKey);
       if (!project) return;
 
-      // Fetch fresh project details from REST API
+      // Fetch fresh project details via tRPC
       let freshProject = project;
       let taskSummary: string | undefined;
       try {
-        const projectData = await restGet(`/api/v1/projects/${project.key}`);
-        if (projectData) {
+        const projectData = await apiCall("projects.getByKey", "GET", { key: project.key });
+        if (projectData?.result?.data?.project) {
+          const proj = projectData.result.data.project;
           freshProject = {
-            key: projectData.project_key,
-            name: projectData.name,
-            description: projectData.description,
-            tech_stack: projectData.tech_stack,
-            conventions: projectData.conventions,
+            key: proj.key,
+            name: proj.name,
+            description: proj.description,
+            tech_stack: proj.techStack,
+            conventions: proj.conventions,
           };
           // Refresh cached project info
           setActiveProject(sessionKey, freshProject);
         }
 
         // Fetch task summary for this agent in this project
-        const agentId = resolveAgentId();
-        const tasksData = await restGet(
-          `/api/v1/tasks/?project_key=${project.key}&agent_id=${encodeURIComponent(agentId)}&limit=50`
-        );
-        if (tasksData?.data && Array.isArray(tasksData.data)) {
-          const tasks = tasksData.data;
+        const agentId = ctx?.agentId ? `agent-${ctx.agentId}` : "unknown";
+        const tasksData = await apiCall("tasks.list", "GET", {
+          projectKey: project.key,
+          assigneeId: agentId,
+          limit: 50
+        });
+        if (tasksData?.result?.data?.items && Array.isArray(tasksData.result.data.items)) {
+          const tasks = tasksData.result.data.items;
           const byStatus: Record<string, number> = {};
           for (const t of tasks) {
             byStatus[t.status] = (byStatus[t.status] || 0) + 1;
@@ -1203,15 +1264,16 @@ export default definePluginEntry({
       },
       execute: async (_toolCallId, args: any) => {
         try {
-          const sessionKey = api.session?.sessionKey ?? "";
+          const sessionKey = resolveSessionKey(_toolCallId);
 
           // No argument: show current project + list available
           if (!args.projectKey) {
             const current = getActiveProject(sessionKey);
-            const projects = await restGet("/api/v1/projects/");
+            const projectsResult = await apiCall("projects.list", "GET", { limit: 50 });
+            const projects = projectsResult?.result?.data?.items || [];
             const list = (Array.isArray(projects) ? projects : []).map((p: any) => {
-              const active = current?.key === p.project_key ? " (ACTIVE)" : "";
-              return `  ${p.project_key}: ${p.name} (${p.task_count} tasks)${active}`;
+              const active = current?.key === p.key ? " (ACTIVE)" : "";
+              return `  ${p.key}: ${p.name} (${p._count?.tasks || 0} tasks)${active}`;
             }).join("\n");
             const header = current
               ? `Current project: ${current.key} — ${current.name}\n\nAvailable projects:\n${list}`
@@ -1219,17 +1281,18 @@ export default definePluginEntry({
             return textResult(header);
           }
 
-          // Fetch project details from REST API
-          const target = await restGet(`/api/v1/projects/${args.projectKey}`);
-          if (!target || !target.project_key) {
+          // Fetch project details via tRPC
+          const targetResult = await apiCall("projects.getByKey", "GET", { key: args.projectKey });
+          const target = targetResult?.result?.data?.project;
+          if (!target || !target.key) {
             return textResult(`Project "${args.projectKey}" not found. Call without arguments to see available projects.`);
           }
 
           const projectInfo: ProjectInfo = {
-            key: target.project_key,
+            key: target.key,
             name: target.name,
             description: target.description,
-            tech_stack: target.tech_stack,
+            tech_stack: target.techStack,
             conventions: target.conventions,
           };
 

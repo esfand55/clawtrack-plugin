@@ -409,6 +409,8 @@ export default definePluginEntry({
           description: { type: "string", description: "Optional: new description" },
           priority: { type: "string", enum: ["low", "medium", "high", "urgent"], description: "Optional: new priority" },
           reviewerId: { type: "string", description: "Optional: Agent ID to assign as reviewer. Set to empty string to clear." },
+          taskType: { type: "string", enum: ["task", "epic", "feature", "bug", "chore"], description: "Optional: new task type" },
+          skills: { type: "array", items: { type: "string" }, description: "Optional: skill names to set (replaces all existing skills)" },
         },
         required: ["taskId"],
       },
@@ -422,11 +424,15 @@ export default definePluginEntry({
           if (args.status) webhookBody.status = args.status;
           if (args.priority) webhookBody.priority = args.priority;
           if (args.reviewerId !== undefined) webhookBody.reviewerId = args.reviewerId || null;
+          if (args.taskType) webhookBody.taskType = args.taskType;
+          if (args.skills) webhookBody.skills = args.skills;
           const result = await apiCall("tasks.webhook", "POST", webhookBody);
           const updates: string[] = [];
           if (args.status) updates.push(`status → ${args.status}`);
           if (args.priority) updates.push(`priority → ${args.priority}`);
           if (args.reviewerId !== undefined) updates.push(`reviewer → ${args.reviewerId || "cleared"}`);
+          if (args.taskType) updates.push(`type → ${args.taskType}`);
+          if (args.skills) updates.push(`skills → [${args.skills.join(", ")}]`);
           return textResult(`Task updated: ${updates.join(", ") || "no changes"}.`, { success: true, task: result.result });
         } catch (error) {
           return textResult(`Failed to update task: ${error}`, { success: false });
@@ -542,6 +548,72 @@ export default definePluginEntry({
           );
         } catch (error) {
           return textResult(`Failed to pick reviewer: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Create task ──
+
+    api.registerTool({
+      name: "clawtrack_create_task",
+      label: "Create ClawTrack task",
+      description: "Create a new task in ClawTrack with support for task type, skills, and attachments. Auto-detects type from title prefix: [EPIC] → epic, [FEATURE] → feature, [BUG] → bug, [CHORE] → chore. Extracts URLs from description as attachments.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Task title. Prefix with [EPIC], [FEATURE], [BUG], or [CHORE] to auto-set taskType." },
+          description: { type: "string", description: "Task description. URLs found here will be auto-extracted as attachments." },
+          priority: { type: "string", enum: ["low", "medium", "high", "urgent"], description: "Priority (default: medium)" },
+          taskType: { type: "string", enum: ["task", "epic", "feature", "bug", "chore"], description: "Task type override. Auto-detected from title prefix if omitted." },
+          skills: { type: "array", items: { type: "string" }, description: "Skill names to associate (e.g., ['TypeScript', 'React'])" },
+          assigneeId: { type: "string", description: "Agent ID to assign (defaults to yourself)" },
+          projectId: { type: "string", description: "Project ID to associate the task with" },
+        },
+        required: ["title"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          // Auto-detect taskType from title prefix
+          let taskType = args.taskType;
+          let cleanTitle = args.title;
+          const prefixMatch = args.title.match(/^\[(EPIC|FEATURE|BUG|CHORE)\]\s*/i);
+          if (prefixMatch) {
+            const detected = prefixMatch[1].toLowerCase();
+            if (!taskType) taskType = detected;
+            cleanTitle = args.title.slice(prefixMatch[0].length);
+          }
+          if (!taskType) taskType = "task";
+
+          // Extract URLs from description as attachments
+          const attachments: { url: string; fileName?: string }[] = [];
+          if (args.description) {
+            const urlRegex = /https?:\/\/[^\s<>"')\]]+/g;
+            let match;
+            while ((match = urlRegex.exec(args.description)) !== null) {
+              attachments.push({ url: match[0] });
+            }
+          }
+
+          const result = await apiCall("tasks.webhook", "POST", {
+            secret: config.webhookSecret,
+            taskId: "new",
+            title: cleanTitle,
+            description: args.description,
+            priority: args.priority || "medium",
+            taskType,
+            skills: args.skills || undefined,
+            attachments: attachments.length > 0 ? attachments : undefined,
+            assigneeId: args.assigneeId || resolveAgentId(),
+            projectId: args.projectId,
+            agentId: resolveAgentId(),
+          });
+
+          return textResult(
+            `Task created: ${cleanTitle} (type: ${taskType}, priority: ${args.priority || "medium"})${attachments.length > 0 ? `, ${attachments.length} attachment(s)` : ""}${args.skills?.length ? `, ${args.skills.length} skill(s)` : ""}`,
+            { success: true, task: result.result?.task },
+          );
+        } catch (error) {
+          return textResult(`Failed to create task: ${error}`, { success: false });
         }
       },
     });
@@ -1219,6 +1291,7 @@ export default definePluginEntry({
       "clawtrack_pick_reviewer",
       "clawtrack_log_activity",
       "clawtrack_send_message_v2",
+      "clawtrack_create_task",
       "clawtrack_set_project",
     ];
 

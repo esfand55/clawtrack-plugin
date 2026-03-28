@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { classifyDomain, getReviewerDomain } from "./domain.js";
 
 // ── Config ──
 
@@ -48,6 +49,12 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
  * - clawtrack_review_task: Approve or reject a task under review
  * - clawtrack_pick_reviewer: Find the least busy engineer to review a task
  * - clawtrack_log_activity: Log an activity entry
+ * - clawtrack_worklog_add: Add a worklog entry to a task (mandatory for state transitions)
+ * - clawtrack_worklog_list: List worklog entries for a task
+ * - clawtrack_block_task: Move task to blocked with reason
+ * - clawtrack_unblock_task: Move blocked task back to in_progress
+ * - clawtrack_qa_review: QA approve/reject (in_testing gate)
+ * - clawtrack_release_task: Release verify/fail (in_releasing gate)
  * - clawtrack_send_message_v2: Send message via unified REST webhook
  *
  * Channel tools (when channelsEnabled):
@@ -135,6 +142,7 @@ export default definePluginEntry({
 
     // ── Helper: make authenticated API call (tRPC) ──
 
+
     async function apiCall(endpoint: string, method: string = "GET", body?: any): Promise<any> {
       let url = `${config.clawtrackUrl}/api/trpc/${endpoint}`;
       const options: RequestInit = {
@@ -196,6 +204,7 @@ export default definePluginEntry({
     // ════════════════════════════════════════════
 
     type ProjectInfo = {
+      id: string;
       key: string;
       name: string;
       description: string | null;
@@ -220,7 +229,7 @@ export default definePluginEntry({
       // Match [PROJECT: KEY — Name] pattern injected by ClawTrack webhook
       const match = content.match(/\[PROJECT:\s*(\S+)\s*[—-]\s*([^\]]+)\]/);
       if (!match) return undefined;
-      return { key: match[1], name: match[2], description: null };
+      return { id: "", key: match[1], name: match[2], description: null };
     }
 
     function buildProjectContextBlock(project: ProjectInfo, taskSummary?: string): string {
@@ -240,17 +249,18 @@ export default definePluginEntry({
       }
       lines.push("All clawtrack operations are automatically scoped to this project.");
       lines.push("");
-      lines.push("## Task Workflow (MANDATORY — follow this on every task)");
-      lines.push("1. Pick work: call clawtrack_list_tasks({ includeBacklog: true }) to see unassigned backlog tasks, self-assign the highest priority one");
+      lines.push("## Task Workflow (MANDATORY — follow shared/WORKFLOW.md for full details)");
+      lines.push("1. ONLY Tech Lead (John) moves backlog → todo. Agents self-assign from todo only.");
       lines.push("2. ONE TASK AT A TIME — never start a second task while one is in_progress");
-      lines.push("3. Move picked task to 'todo', sort your todo list by priority, start the top one → 'in_progress'");
-      lines.push("4. When done: call clawtrack_pick_reviewer() to find the least busy engineer, set them as reviewer");
-      lines.push("5. Set reviewer via clawtrack_update_task(taskId, { reviewerId: '...' })");
-      lines.push("6. Move to 'review' via clawtrack_update_task_status(taskId, 'review') and message the reviewer");
-      lines.push("7. NEVER call clawtrack_update_task_status(taskId, 'done') — only reviewers approve tasks via clawtrack_review_task()");
-      lines.push("8. If you are the assigned reviewer: finish your current task first (no context switching), then review");
-      lines.push("9. Use clawtrack_review_task(taskId, decision, feedback) to approve or reject");
-      lines.push("10. If you reject: explain clearly what needs to change so the assignee can fix it");
+      lines.push("3. Self-assign from todo: clawtrack_update_task(taskId, { assigneeId: 'your-id' }), then move to in_progress");
+      lines.push("4. Add worklog entries via clawtrack_worklog_add(taskId, content) for EVERY state transition");
+      lines.push("5. When done: clawtrack_pick_reviewer(taskId) → set reviewer → clawtrack_update_task_status(taskId, 'review')");
+      lines.push("   clawtrack_pick_reviewer automatically selects a domain-matched reviewer (backend/frontend) based on task skills");
+      lines.push("6. Reviewer approves: clawtrack_review_task → moves to in_testing → QA (Ted) tests");
+      lines.push("7. QA approves: clawtrack_qa_review → moves to in_releasing → assignee releases");
+      lines.push("8. Assignee releases: clawtrack_release_task → moves to done");
+      lines.push("9. Blocked? Use clawtrack_block_task(taskId, reason) → notify Tech Lead");
+      lines.push("10. NEVER skip states. NEVER move to done directly. Full flow: backlog → todo → in_progress → review → in_testing → in_releasing → done");
       return "\n" + lines.join("\n") + "\n";
     }
 
@@ -346,12 +356,12 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_update_task_status",
       label: "Update ClawTrack task status",
-      description: "Update the status of a ClawTrack task. RULES: (1) You CANNOT go directly to 'done' — tasks must go through review first. (2) To move to 'review', you must first assign a reviewer via clawtrack_update_task. Valid flow: backlog → todo → in_progress → review → done.",
+      description: "Update the status of a ClawTrack task. RULES: (1) You CANNOT go directly to 'done' — tasks must go through review → in_testing → in_releasing → done. (2) To move to 'review', you must first assign a reviewer via clawtrack_update_task. (3) You MUST add a worklog entry via clawtrack_worklog_add BEFORE calling this. Valid flow: backlog → todo → in_progress → review → in_testing → in_releasing → done. Use clawtrack_block_task for blocking instead.",
       parameters: {
         type: "object",
         properties: {
           taskId: { type: "string", description: "The ClawTrack task ID" },
-          status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "The new status" },
+          status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "in_testing", "in_releasing", "done"], description: "The new status" },
         },
         required: ["taskId", "status"],
       },
@@ -380,7 +390,7 @@ export default definePluginEntry({
         type: "object",
         properties: {
           projectKey: { type: "string", description: "The project key (e.g., CLAW). Omit to use the active project." },
-          status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "Optional: filter by status" },
+          status: { type: "string", enum: ["backlog", "todo", "in_progress", "blocked", "review", "in_testing", "in_releasing", "done"], description: "Optional: filter by status" },
         },
       },
       execute: async (_toolCallId, args: any) => {
@@ -414,7 +424,7 @@ export default definePluginEntry({
       parameters: {
         type: "object",
         properties: {
-          status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "Optional: filter by status" },
+          status: { type: "string", enum: ["backlog", "todo", "in_progress", "blocked", "review", "in_testing", "in_releasing", "done"], description: "Optional: filter by status" },
           projectKey: { type: "string", description: "Optional: override the active project filter" },
           limit: { type: "number", description: "Maximum tasks to return (default: 50)" },
           includeBacklog: { type: "boolean", description: "If true, also return unassigned backlog tasks you can pick up" },
@@ -457,14 +467,15 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_update_task",
       label: "Update ClawTrack task",
-      description: "Update a ClawTrack task's status, description, priority, and/or reviewer in a single call.",
+      description: "Update a ClawTrack task's status, description, priority, assignee, and/or reviewer in a single call. MUST add a worklog entry via clawtrack_worklog_add before every status transition.",
       parameters: {
         type: "object",
         properties: {
           taskId: { type: "string", description: "The ClawTrack task ID" },
-          status: { type: "string", enum: ["backlog", "todo", "in_progress", "review", "done"], description: "Optional: new status" },
+          status: { type: "string", enum: ["backlog", "todo", "in_progress", "blocked", "review", "in_testing", "in_releasing", "done"], description: "Optional: new status" },
           description: { type: "string", description: "Optional: new description" },
           priority: { type: "string", enum: ["low", "medium", "high", "urgent"], description: "Optional: new priority" },
+          assigneeId: { type: "string", description: "Optional: Agent ID to assign as the task owner. Set to empty string to clear." },
           reviewerId: { type: "string", description: "Optional: Agent ID to assign as reviewer. Set to empty string to clear." },
           taskType: { type: "string", enum: ["task", "epic", "feature", "bug", "chore"], description: "Optional: new task type" },
           skills: { type: "array", items: { type: "string" }, description: "Optional: skill names to set (replaces all existing skills)" },
@@ -480,6 +491,7 @@ export default definePluginEntry({
           };
           if (args.status) webhookBody.status = args.status;
           if (args.priority) webhookBody.priority = args.priority;
+          if (args.assigneeId !== undefined) webhookBody.assigneeId = args.assigneeId || null;
           if (args.reviewerId !== undefined) webhookBody.reviewerId = args.reviewerId || null;
           if (args.taskType) webhookBody.taskType = args.taskType;
           if (args.skills) webhookBody.skills = args.skills;
@@ -487,6 +499,7 @@ export default definePluginEntry({
           const updates: string[] = [];
           if (args.status) updates.push(`status → ${args.status}`);
           if (args.priority) updates.push(`priority → ${args.priority}`);
+          if (args.assigneeId !== undefined) updates.push(`assignee → ${args.assigneeId || "cleared"}`);
           if (args.reviewerId !== undefined) updates.push(`reviewer → ${args.reviewerId || "cleared"}`);
           if (args.taskType) updates.push(`type → ${args.taskType}`);
           if (args.skills) updates.push(`skills → [${args.skills.join(", ")}]`);
@@ -502,30 +515,32 @@ export default definePluginEntry({
     api.registerTool({
       name: "clawtrack_review_task",
       label: "Review ClawTrack task",
-      description: "Approve or reject a task that is under review. Call this when you are the assigned reviewer. Approving moves the task to Done; rejecting sends it back to In Progress with your feedback.",
+      description: "Approve or reject a task that is under review. Call this when you are the assigned reviewer. Approving moves the task to in_testing (QA gate); rejecting sends it back to In Progress with your feedback. MUST add a worklog entry via clawtrack_worklog_add before calling this.",
       parameters: {
         type: "object",
         properties: {
           taskId: { type: "string", description: "The ClawTrack task ID" },
           decision: { type: "string", enum: ["approve", "reject"], description: "Whether to approve or reject the task" },
-          feedback: { type: "string", description: "Feedback explaining your decision. Required when rejecting." },
+          feedback: { type: "string", description: "Feedback explaining your decision. Required when rejecting. Must include numbered issues AND numbered fix instructions." },
         },
         required: ["taskId", "decision"],
       },
       execute: async (_toolCallId, args: any) => {
         try {
-          const newStatus = args.decision === "approve" ? "done" : "in_progress";
+          const newStatus = args.decision === "approve" ? "in_testing" : "in_progress";
+          const reviewStatus = args.decision === "approve" ? "approved" : "rejected";
           const result = await apiCall("tasks.webhook", "POST", {
             secret: config.webhookSecret,
             taskId: args.taskId,
             agentId: resolveAgentId(_toolCallId),
             status: newStatus,
+            reviewStatus,
           });
 
           // Post feedback as a comment
           const commentText = args.decision === "approve"
-            ? "Task approved."
-            : `Changes requested: ${args.feedback || "No feedback provided."}`;
+            ? "✅ Task approved in code review. Moving to QA testing."
+            : `🔄 Changes requested: ${args.feedback || "No feedback provided."}`;
 
           await webhookCall({
             type: "message",
@@ -537,7 +552,7 @@ export default definePluginEntry({
 
           return textResult(
             args.decision === "approve"
-              ? `Task approved and moved to Done.`
+              ? `Task approved and moved to In Testing. QA (Ted) will test next.`
               : `Task rejected and sent back to In Progress. Feedback sent.`,
             { success: true, task: result.result },
           );
@@ -547,17 +562,19 @@ export default definePluginEntry({
       },
     });
 
-    // ── Tool: Pick reviewer (find least busy engineer) ──
+    // ── Tool: Pick reviewer (domain-aware, review-count based) ──
 
     api.registerTool({
       name: "clawtrack_pick_reviewer",
       label: "Pick a reviewer for a task",
-      description: "Find the best engineer to review a task. Returns the agent with the fewest active tasks (todo + in_progress). Excludes the specified agent (usually yourself). Use this when you need to assign a reviewer after completing work.",
+      description: "Find the best code reviewer for a task. Determines the task domain (frontend/backend) from its skills and selects the reviewer with the fewest active review assignments in that domain. Always returns a result as long as reviewer agents exist.",
       parameters: {
         type: "object",
         properties: {
+          taskId: { type: "string", description: "The task ID needing a reviewer. Used to determine domain (frontend/backend) from task skills." },
           excludeAgentId: { type: "string", description: "Agent ID to exclude from reviewer selection (usually your own ID)" },
         },
+        required: ["taskId"],
       },
       execute: async (_toolCallId, args: any) => {
         try {
@@ -569,39 +586,100 @@ export default definePluginEntry({
             return textResult("No active project set. Activate a project with clawtrack_set_project first.", { success: false });
           }
 
-          // Fetch all tasks in the project to count per agent
-          const params: any = { projectKey: effectiveProjectKey, limit: 100 };
-          const result = await apiCall("tasks.list", "GET", params);
-          const tasks = result?.result?.data?.items;
+          // 1. Fetch ALL agents
+          const agentsResult = await apiCall("agents.list", "GET", { limit: 50 });
+          const agents = agentsResult?.result?.data?.items;
+          if (!Array.isArray(agents)) {
+            return textResult("Failed to fetch agents.", { success: false });
+          }
+
+          // 2. Filter to reviewer agents (role contains "Reviewer")
+          const reviewerAgents = agents.filter(
+            (a: any) => a.role && a.role.toLowerCase().includes("reviewer")
+          );
+
+          if (reviewerAgents.length === 0) {
+            return textResult("No reviewer agents registered in the system. Please register reviewer agents first.", { success: false });
+          }
+
+          // 3. Determine task domain from skills
+          let taskDomain: "frontend" | "backend" | "unknown" = "unknown";
+          try {
+            const skillsResult = await apiCall(`skills.getByTask?input=${encodeURIComponent(JSON.stringify({ taskId: args.taskId }))}`);
+            const skills = Array.isArray(skillsResult?.result?.data) ? skillsResult.result.data :
+                           (Array.isArray(skillsResult?.result) ? skillsResult.result : []);
+            if (skills.length > 0) {
+              taskDomain = classifyDomain(skills);
+            }
+          } catch {
+            // Skills fetch failed — fall back to unknown domain
+          }
+
+          // 4. Fetch all tasks in the project to count review assignments
+          const tasksParams: any = { projectKey: effectiveProjectKey, limit: 100 };
+          const tasksResult = await apiCall("tasks.list", "GET", tasksParams);
+          const tasks = tasksResult?.result?.data?.items;
           if (!Array.isArray(tasks)) {
             return textResult("Failed to fetch tasks for workload analysis.", { success: false });
           }
 
-          // Count active tasks per agent (todo + in_progress)
-          const workload: Record<string, { count: number; name: string; emoji: string; id: string }> = {};
+          // 5. Count review-assigned tasks per reviewer (where they are reviewerId, in active review states)
+          const reviewCounts: Record<string, number> = {};
           for (const task of tasks) {
-            const assigneeId = task.assigneeId;
-            if (!assigneeId) continue;
-            const status = task.status;
-            if (status !== "todo" && status !== "in_progress") continue;
-            if (assigneeId === args.excludeAgentId) continue;
-            if (!workload[assigneeId]) {
-              workload[assigneeId] = { count: 0, name: task.assignee?.name || assigneeId, emoji: task.assignee?.emoji || "👤", id: assigneeId };
+            const reviewerId = task.reviewerId;
+            if (!reviewerId) continue;
+            if (["review", "in_testing", "in_releasing"].includes(task.status)) {
+              reviewCounts[reviewerId] = (reviewCounts[reviewerId] || 0) + 1;
             }
-            workload[assigneeId].count++;
           }
 
-          // Sort by task count (ascending) — least busy first
-          const sorted = Object.values(workload).sort((a, b) => a.count - b.count);
+          // 6. Filter reviewers by domain (if domain is known)
+          let candidates = reviewerAgents.filter((a: any) => {
+            if (args.excludeAgentId && a.id === args.excludeAgentId) return false;
+            if (taskDomain !== "unknown") {
+              return getReviewerDomain(a.role) === taskDomain;
+            }
+            return true;
+          });
+
+          // 7. If no domain-specific reviewers found, fall back to ALL reviewers
+          if (candidates.length === 0) {
+            candidates = reviewerAgents.filter((a: any) => {
+              if (args.excludeAgentId && a.id === args.excludeAgentId) return false;
+              return true;
+            });
+          }
+
+          // 8. Sort by review count (ascending) — fewest reviews first
+          const sorted = candidates.map((a: any) => ({
+            id: a.id,
+            name: a.name,
+            emoji: a.emoji,
+            role: a.role,
+            reviewCount: reviewCounts[a.id] || 0,
+            domain: getReviewerDomain(a.role),
+          })).sort((a: any, b: any) => a.reviewCount - b.reviewCount);
 
           if (sorted.length === 0) {
-            return textResult("No other agents with active tasks found in this project.", { success: false });
+            return textResult("No available reviewers found.", { success: false });
           }
 
           const picked = sorted[0];
+          const domainLabel = taskDomain !== "unknown" ? ` (${taskDomain} domain)` : "";
           return textResult(
-            `Suggested reviewer: ${picked.emoji} ${picked.name} (${picked.count} active tasks).\nOther options: ${sorted.slice(1).map(a => `${a.emoji} ${a.name} (${a.count})`).join(", ")}`,
-            { success: true, reviewer: { agentId: picked.id, agentName: picked.name, agentEmoji: picked.emoji, taskCount: picked.count }, allAgents: sorted },
+            `Suggested reviewer${domainLabel}: ${picked.emoji} ${picked.name} (${picked.reviewCount} active reviews, ${picked.role}).\nOther options: ${sorted.slice(1).map((a: any) => `${a.emoji} ${a.name} (${a.reviewCount})`).join(", ")}`,
+            {
+              success: true,
+              reviewer: {
+                agentId: picked.id,
+                agentName: picked.name,
+                agentEmoji: picked.emoji,
+                reviewCount: picked.reviewCount,
+                domain: picked.domain,
+              },
+              taskDomain,
+              allReviewers: sorted,
+            },
           );
         } catch (error) {
           return textResult(`Failed to pick reviewer: ${error}`, { success: false });
@@ -661,7 +739,7 @@ export default definePluginEntry({
             skills: args.skills || undefined,
             attachments: attachments.length > 0 ? attachments : undefined,
             assigneeId: args.assigneeId || resolveAgentId(_toolCallId),
-            projectId: args.projectId,
+            projectId: args.projectId || getActiveProject(resolveSessionKey(_toolCallId))?.id || undefined,
             agentId: resolveAgentId(_toolCallId),
           });
 
@@ -701,6 +779,275 @@ export default definePluginEntry({
           return textResult("Activity logged.", { success: true, activityId: result.activityId });
         } catch (error) {
           return textResult(`Failed to log activity: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Add worklog entry ──
+
+    api.registerTool({
+      name: "clawtrack_worklog_add",
+      label: "Add worklog entry",
+      description: "Add a worklog entry to a ClawTrack task. Use for state transitions, progress updates, review notes, QA results, and any significant task activity. Every state transition MUST have a worklog entry.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          content: { type: "string", description: "Full markdown content of the worklog entry. Be specific and complete." },
+          action: { type: "string", description: "Brief one-line summary of the entry's purpose (e.g., 'Started implementation', 'State transition: in_progress -> review')" },
+        },
+        required: ["taskId", "content"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const result = await apiCall("tasks.worklogWebhook", "POST", {
+            secret: config.webhookSecret,
+            taskId: args.taskId,
+            content: args.content,
+            action: args.action,
+            agentId: resolveAgentId(_toolCallId),
+          });
+          return textResult("Worklog entry added.", { success: true, entryId: result.result?.data?.id });
+        } catch (error) {
+          return textResult(`Failed to add worklog entry: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: List worklog entries ──
+
+    api.registerTool({
+      name: "clawtrack_worklog_list",
+      label: "List worklog entries",
+      description: "View the worklog history for a ClawTrack task. Use this before reviewing or testing a task to understand what was done. Returns entries in reverse chronological order.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          limit: { type: "number", description: "Maximum entries to return (default: 20)" },
+        },
+        required: ["taskId"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const result = await apiCall("tasks.worklog.list", "GET", {
+            taskId: args.taskId,
+            limit: args.limit || 20,
+            secret: config.webhookSecret,
+          });
+          const items = result.result?.data?.items || [];
+          if (items.length === 0) {
+            return textResult("No worklog entries found for this task.", { entries: 0 });
+          }
+          const formatted = items.map((e: any) => {
+            const agent = e.agent ? `${e.agent.emoji} ${e.agent.name}` : "Unknown";
+            const time = new Date(e.createdAt).toISOString().replace("T", " ").substring(0, 16);
+            const action = e.metadata?.action || e.description?.substring(0, 60);
+            return `[${time}] ${agent} (${e.agent?.role || "unknown"}): ${action}`;
+          });
+          return textResult(`Worklog (${items.length} entries):\n${formatted.join("\n")}`, {
+            entries: items.length,
+            items: items.map((e: any) => ({ id: e.id, content: e.description, agent: e.agent?.name, createdAt: e.createdAt })),
+          });
+        } catch (error) {
+          return textResult(`Failed to list worklog: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Block task ──
+
+    api.registerTool({
+      name: "clawtrack_block_task",
+      label: "Block ClawTrack task",
+      description: "Move a task to 'blocked' status with a reason. Use when you are the assignee and cannot proceed due to an external dependency. This will notify the Tech Lead. You MUST add a worklog entry via clawtrack_worklog_add BEFORE calling this.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          reason: { type: "string", description: "Why the task is blocked. Include: what dependency is needed, impact of delay, and any attempted workarounds." },
+        },
+        required: ["taskId", "reason"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const agentId = resolveAgentId(_toolCallId);
+          // Move to blocked
+          const result = await apiCall("tasks.webhook", "POST", {
+            json: {
+              secret: config.webhookSecret,
+              taskId: args.taskId,
+              agentId,
+              status: "blocked",
+            }
+          });
+
+          // Post reason as worklog via message
+          await webhookCall({
+            type: "message",
+            taskId: args.taskId,
+            role: "agent",
+            content: `🚫 **Task Blocked**\n\n**Reason:** ${args.reason}\n\nTech Lead (John) has been notified. Awaiting unblock confirmation.`,
+            agentId,
+          });
+
+          return textResult(
+            `Task moved to Blocked. Reason: ${args.reason.substring(0, 100)}. Tech Lead will be notified.`,
+            { success: true, task: result.result },
+          );
+        } catch (error) {
+          return textResult(`Failed to block task: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Unblock task ──
+
+    api.registerTool({
+      name: "clawtrack_unblock_task",
+      label: "Unblock ClawTrack task",
+      description: "Move a blocked task back to 'in_progress'. ONLY Tech Lead should confirm the blocker is resolved before this is called. The assignee should call this after Tech Lead confirmation.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          resolution: { type: "string", description: "How the blocker was resolved. Who confirmed it and what changed." },
+        },
+        required: ["taskId", "resolution"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const agentId = resolveAgentId(_toolCallId);
+          // Move to in_progress
+          const result = await apiCall("tasks.webhook", "POST", {
+            json: {
+              secret: config.webhookSecret,
+              taskId: args.taskId,
+              agentId,
+              status: "in_progress",
+            }
+          });
+
+          await webhookCall({
+            type: "message",
+            taskId: args.taskId,
+            role: "agent",
+            content: `✅ **Task Unblocked**\n\n**Resolution:** ${args.resolution}\n\nResuming work.`,
+            agentId,
+          });
+
+          return textResult(
+            `Task unblocked and moved to In Progress. Resolution: ${args.resolution.substring(0, 100)}.`,
+            { success: true, task: result.result },
+          );
+        } catch (error) {
+          return textResult(`Failed to unblock task: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: QA Review ──
+
+    api.registerTool({
+      name: "clawtrack_qa_review",
+      label: "QA review ClawTrack task",
+      description: "QA (Ted) approves or rejects a task that is in_testing. Approving moves to in_releasing; rejecting sends back to in_progress with reproduction steps. MUST add a worklog entry with test results via clawtrack_worklog_add BEFORE calling this.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          decision: { type: "string", enum: ["approve", "reject"], description: "Whether QA approves or rejects" },
+          testResults: { type: "string", description: "Test results: what was tested, pass/fail for each acceptance criterion. Required for both approve and reject." },
+          reproductionSteps: { type: "string", description: "Step-by-step reproduction steps. Required when rejecting." },
+        },
+        required: ["taskId", "decision", "testResults"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const agentId = resolveAgentId(_toolCallId);
+          const newStatus = args.decision === "approve" ? "in_releasing" : "in_progress";
+          const result = await apiCall("tasks.webhook", "POST", {
+            json: {
+              secret: config.webhookSecret,
+              taskId: args.taskId,
+              agentId,
+              status: newStatus,
+            }
+          });
+
+          const commentText = args.decision === "approve"
+            ? `🧪 **QA Approved**\n\n**Test Results:** ${args.testResults}\n\nReady for release. Assignee: please deploy and verify.`
+            : `🧪 **QA Rejected**\n\n**Test Results:** ${args.testResults}\n\n**Reproduction Steps:** ${args.reproductionSteps || "Not provided"}\n\nSending back to assignee for fixes.`;
+
+          await webhookCall({
+            type: "message",
+            taskId: args.taskId,
+            role: "agent",
+            content: commentText,
+            agentId,
+          });
+
+          return textResult(
+            args.decision === "approve"
+              ? `QA approved. Task moved to In Releasing. Assignee should deploy and verify.`
+              : `QA rejected. Task sent back to In Progress with reproduction steps.`,
+            { success: true, task: result.result },
+          );
+        } catch (error) {
+          return textResult(`Failed to QA review: ${error}`, { success: false });
+        }
+      },
+    });
+
+    // ── Tool: Release task ──
+
+    api.registerTool({
+      name: "clawtrack_release_task",
+      label: "Release ClawTrack task",
+      description: "Assignee confirms deployment of a task in in_releasing status. On success moves to done; on failure moves back to in_progress. MUST add a worklog entry via clawtrack_worklog_add BEFORE calling this.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ClawTrack task ID" },
+          success: { type: "boolean", description: "Whether the deployment succeeded (true → done) or failed (false → in_progress)" },
+          deployDetails: { type: "string", description: "Deployment details: what was deployed, where, and verification results. Required." },
+          failureDetails: { type: "string", description: "If deploy failed: what went wrong, error messages, and next steps. Required when success=false." },
+        },
+        required: ["taskId", "success", "deployDetails"],
+      },
+      execute: async (_toolCallId, args: any) => {
+        try {
+          const agentId = resolveAgentId(_toolCallId);
+          const newStatus = args.success ? "done" : "in_progress";
+          const result = await apiCall("tasks.webhook", "POST", {
+            json: {
+              secret: config.webhookSecret,
+              taskId: args.taskId,
+              agentId,
+              status: newStatus,
+            }
+          });
+
+          const commentText = args.success
+            ? `🚀 **Deployed Successfully**\n\n**Details:** ${args.deployDetails}\n\nTask complete.`
+            : `❌ **Deploy Failed**\n\n**Details:** ${args.deployDetails}\n**Failure:** ${args.failureDetails || "Not provided"}\n\nSending back to in_progress for fixes. Tech Lead has been notified.`;
+
+          await webhookCall({
+            type: "message",
+            taskId: args.taskId,
+            role: "agent",
+            content: commentText,
+            agentId,
+          });
+
+          return textResult(
+            args.success
+              ? `Deploy verified. Task moved to Done. 🎉`
+              : `Deploy failed. Task moved back to In Progress. Fix and re-submit through review.`,
+            { success: true, task: result.result },
+          );
+        } catch (error) {
+          return textResult(`Failed to release task: ${error}`, { success: false });
         }
       },
     });
@@ -985,6 +1332,7 @@ export default definePluginEntry({
                 apiCall("projects.getByKey", "GET", { key: parsed.key }).then((full) => {
                   const proj = full?.result?.data?.project;
                   if (proj?.key) {
+                    parsed.id = proj.id;
                     parsed.description = proj.description;
                     parsed.tech_stack = proj.techStack;
                     parsed.conventions = proj.conventions;
@@ -1209,6 +1557,7 @@ export default definePluginEntry({
         if (projectData?.result?.data?.project) {
           const proj = projectData.result.data.project;
           freshProject = {
+            id: proj.id,
             key: proj.key,
             name: proj.name,
             description: proj.description,
@@ -1289,6 +1638,7 @@ export default definePluginEntry({
           }
 
           const projectInfo: ProjectInfo = {
+            id: target.id,
             key: target.key,
             name: target.name,
             description: target.description,
@@ -1353,6 +1703,12 @@ export default definePluginEntry({
       "clawtrack_review_task",
       "clawtrack_pick_reviewer",
       "clawtrack_log_activity",
+      "clawtrack_worklog_add",
+      "clawtrack_worklog_list",
+      "clawtrack_block_task",
+      "clawtrack_unblock_task",
+      "clawtrack_qa_review",
+      "clawtrack_release_task",
       "clawtrack_send_message_v2",
       "clawtrack_create_task",
       "clawtrack_set_project",
